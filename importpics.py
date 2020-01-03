@@ -2,24 +2,32 @@
 """
 Copies picture files taken by a camera from removable media like
 flash, automatically creating new folders based on dates.
+
+Warning: this has to read all filenames into memory at once (in
+order to match jpg and nef files together, etc)
 """
 
+# STL
 import argparse
 import collections
 import datetime
-import inspect
+#import inspect
 import hashlib
 import os
 import pathlib
 import re
 import shlex
-import subprocess
-from subprocess import PIPE
+#import subprocess
+#from subprocess import PIPE
 import sys
 import time
 
+# LIB
 import exifread
 from dateutil.parser import parse
+
+# PROJ
+import diskutil
 
 YYMMDD = "%y%m%d"
 
@@ -30,11 +38,52 @@ except NameError: pass
 class Metrics:
     def __init__(self):
         self.started = int(time.time())
+        self.total_seen = None
+        self.already_copied = None
+        self.too_old = None
+        self.copied = None
+        self.start_disk_avail = None # in bytes
+        self.end_disk_avail = None
+
+
+    def inc_already_copied(self, items = None):
+        items = items or [1]
+        if self.already_copied is None:
+            self.already_copied = 0
+        self.already_copied += len(items)
+
+    def inc_too_old(self, items = None):
+        items = items or [1]
+        if self.too_old is None:
+            self.too_old = 0
+        self.too_old += len(items)
+
+    def inc_copied(self, items = None):
+        items = items or [1]
+        self.copied = self.copied or 0
+        self.copied += len(items)
 
     def __str__(self):
         lines = []
         elapsed_sec = int(time.time()) - started
         lines.append("Total time: {} seconds".format(elapsed_sec))
+        def p(msg, count):
+            if count is not None:
+                lines.append(msg.format(count))
+        #if self.total_seen is not None:
+        #    lines.append("Total picture files found: {}".format(self.total_seen))
+        #if self.already_copied is not None:
+        #    lines.append("Already copied: {}".format(self.already_copied))
+        p("Total picture files found: {}", self.total_seen)
+        p("Already copied: {}", self.already_copied)
+        p("Too old to copy: {}", self.too_old)
+        p("Copied: {}", self.copied)
+        if self.start_disk_avail is not None:
+            avail = diskutil.human_readable(self.start_disk_avail)
+            lines.append("Disk space available before copy: {}".format(avail))
+        if self.end_disk_avail is not None:
+            avail = diskutil.human_readable(self.end_disk_avail)
+            lines.append("Disk space available after copy: {}".format(avail))
         return "\n".join(lines)
 
 def prompt(msg, default):
@@ -118,9 +167,9 @@ def choose_volume(volumes):
             print("that was not a valid choice -- press ctrl+c if you want to exit")
 
 
-def to_lines(stdout):
-    lines = [line.strip() for line in stdout.split("\n")]
-    return [line for line in lines if line != ""]
+#def to_lines(stdout):
+#    lines = [line.strip() for line in stdout.split("\n")]
+#    return [line for line in lines if line != ""]
 
 
 def ext_match(filename, extensions):
@@ -304,35 +353,45 @@ class CopyPlan:
         """
         return (self.started_dt.date() - dt.date()).days <= self.lookback_days
 
-def try_copy(copyplan, copylog, fg):
+def try_copy(metrics, copyplan, copylog, fg):
     """
     Tries to ensure all pictures files in the file group are copied
     :param copylog: the log that tracks if files have already been copied
     :param fg: object representing the group of files to copy
     """
     if copylog.already_copied(*fg):
+        metrics.inc_already_copied(list(fg))
         print("Already copied: {}".format(fg.base_path))
         return
 
     tags = exif_tags(fg.jpg())
     d = exif_date(tags)
     if not copyplan.in_lookback(d):
+        metrics.inc_too_old(list(fg))
         print("Too old to copy: {}".format(fg.base_path))
         return
+
+    # get total file size for both files
+    print("file sizes for {}".format(fg.base_path))
+    for f in fg:
+        print("\t{}".format(os.path.getsize(f)))
 
     print(d.strftime(YYMMDD))
     print(fg.base_path)
     for f in fg:
         if copylog.already_copied(f):
+            metrics.inc_already_copied()
             print("\t Already copied file: {}".format(f))
         else:
             copylog.add(f)
+            metrics.inc_copied()
             print("\t{}".format(f))
             #print(get_dest_subfolder(tags, YYMMDD))
 
 
-def copy_pictures(logsfolder, picfiles, lookback_days):
+def copy_pictures(metrics, logsfolder, picfiles, lookback_days):
     copyplan = CopyPlan(lookback_days)
+    metrics.total_seen = len(picfiles)
 
     def name(path):
         return str(pathlib.Path(path).with_suffix(""))
@@ -345,25 +404,25 @@ def copy_pictures(logsfolder, picfiles, lookback_days):
 
     with CopyLog.load(logsfolder) as copylog:
         for g in groups.keys():
-            try_copy(copyplan, copylog, groups[g])
+            try_copy(metrics, copyplan, copylog, groups[g])
 
 
 def show_info():
     pass
 
 
-def get_volume_list():
-    """:returns: list of removable media"""
-    mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
-    cmdpath = os.path.join(mypath, "findflash.macos.sh")
-    cmd = shlex.split(cmdpath)
-    p = subprocess.Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, stdin=PIPE, text=True)
-    stdout, stderr = p.communicate()
-    if p.returncode != 0:
-        print(stderr)
-        sys.exit(1)
-    else:
-        return to_lines(stdout)
+#def get_volume_list():
+#    """:returns: list of removable media"""
+#    mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
+#    cmdpath = os.path.join(mypath, "findflash.macos.sh")
+#    cmd = shlex.split(cmdpath)
+#    p = subprocess.Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, stdin=PIPE, text=True)
+#    stdout, stderr = p.communicate()
+#    if p.returncode != 0:
+#        print(stderr)
+#        sys.exit(1)
+#    else:
+#        return to_lines(stdout)
 
 
 if __name__ == "__main__":
@@ -382,7 +441,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.info:
-        volume_list = get_volume_list()
+        volume_list = diskutil.get_volume_list()
         volume_path = choose_volume(volume_list)
         pics = all_pics(volume_path)
         for p in pics:
@@ -422,7 +481,7 @@ if __name__ == "__main__":
         print(get_dest_subfolder(tags, YYMMDD))
         sys.exit(0)
 
-    volume_list = get_volume_list()
+    volume_list = diskutil.get_volume_list()
     volume_path = choose_volume(volume_list)
     pics = all_pics(volume_path)
     #for p in pics:
@@ -439,11 +498,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(1)
 
-    copy_pictures(logsfolder, pics, args.days)
+    metrics.start_disk_avail = diskutil.avail_space(destpath)
+    copy_pictures(metrics, logsfolder, pics, args.days)
 
-    elapsed_sec = int(time.time() - started)
-    print("Total time: {} seconds".format(elapsed_sec))
-    # TODO - print total file paths seen
+    metrics.end_disk_avail = diskutil.avail_space(destpath)
+    print(metrics)
+    #elapsed_sec = int(time.time() - started)
+    #print("Total time: {} seconds".format(elapsed_sec))
+    #print("available space at {}: {}".format(destpath, diskutil.avail_space(destpath)))
    
 
 
