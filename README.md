@@ -10,6 +10,7 @@ You might need to do the following
 brew install python
 pip3 install exifread
 pip3 install python-dateutil
+pip3 install dateparser
 
 ```
 

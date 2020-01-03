@@ -6,11 +6,12 @@ flash, automatically creating new folders based on dates.
 
 import argparse
 import collections
-from dateutil.parser import parse
+import datetime
 import inspect
 import hashlib
 import os
 import pathlib
+import re
 import shlex
 import subprocess
 from subprocess import PIPE
@@ -18,10 +19,23 @@ import sys
 import time
 
 import exifread
+from dateutil.parser import parse
+
+YYMMDD = "%y%m%d"
 
 try: raw_input = input
 except NameError: pass
 
+
+class Metrics:
+    def __init__(self):
+        self.started = int(time.time())
+
+    def __str__(self):
+        lines = []
+        elapsed_sec = int(time.time()) - started
+        lines.append("Total time: {} seconds".format(elapsed_sec))
+        return "\n".join(lines)
 
 def prompt(msg, default):
     if default is None:
@@ -29,6 +43,24 @@ def prompt(msg, default):
     else:
         choice = raw_input("{} [{}]>".format(msg, default))
         return choice or default
+
+def parse_camera_date(datestr):
+    """
+    Nikon cameras seem to use this restarted format for dates:
+        2020:01:02 16:11:06
+    and that seems to break both dateutil and dateparser.
+    So I have to manually provite a format :(
+
+    :param datestr: date string from EXIF metadata
+
+    >>> parse_camera_date("2020:01:02 16:11:06")
+    datetime.datetime(2020, 1, 2, 16, 11, 6)
+    """
+    if re.match(r"^\s*\d\d+:\d\d:\d\d\s+\d\d:\d\d:\d\d\s*$", datestr):
+        # its in the stupid nikon format
+        datestr = datestr.replace(":", "-", 2)
+    return parse(datestr)
+    pass
 
 def get_destpath(cfgfolder, cfgfile):
     cfgfolder = os.path.expanduser(cfgfolder)
@@ -130,8 +162,9 @@ def exif_date(tags):
 
     dates = { tag: str(tags[tag]) for tag in tags.keys() if tag in date_tags }
     # sort so that we always attempt to read the values in the same order
-    for k in sorted(dates.keys()):
-        return parse(dates[k])
+    # reversed because I comes after E
+    for k in reversed(sorted(dates.keys())):
+        return parse_camera_date(dates[k])
 
     raise Exception("unable to read EXIF date of image")
 
@@ -248,7 +281,30 @@ class FileGroup:
         return str(pathlib.Path(path).with_suffix(""))
 
 
-def try_copy(copylog, fg):
+class CopyPlan:
+    def __init__(self, lookback_days, started_dt = None):
+        if lookback_days < 1:
+            raise ValueError()
+        self.lookback_days = lookback_days
+        self.started_dt = started_dt or datetime.datetime.now()
+
+    def in_lookback(self, dt):
+        """
+        Returns True if the date is within the lookback period
+        >>> CopyPlan(3, datetime.datetime(2010, 6, 20)).in_lookback(datetime.datetime(2010, 6, 20))
+        True
+        >>> CopyPlan(3, datetime.datetime(2010, 6, 20)).in_lookback(datetime.datetime(2010, 6, 19))
+        True
+        >>> CopyPlan(3, datetime.datetime(2010, 6, 20)).in_lookback(datetime.datetime(2010, 6, 18))
+        True
+        >>> CopyPlan(3, datetime.datetime(2010, 6, 20)).in_lookback(datetime.datetime(2010, 6, 17))
+        True
+        >>> CopyPlan(3, datetime.datetime(2010, 6, 20)).in_lookback(datetime.datetime(2010, 6, 16))
+        False
+        """
+        return (self.started_dt.date() - dt.date()).days <= self.lookback_days
+
+def try_copy(copyplan, copylog, fg):
     """
     Tries to ensure all pictures files in the file group are copied
     :param copylog: the log that tracks if files have already been copied
@@ -260,21 +316,23 @@ def try_copy(copylog, fg):
 
     tags = exif_tags(fg.jpg())
     d = exif_date(tags)
-    print(d.strftime(yymmdd))
+    if not copyplan.in_lookback(d):
+        print("Too old to copy: {}".format(fg.base_path))
+        return
 
-    
+    print(d.strftime(YYMMDD))
     print(fg.base_path)
     for f in fg:
         if copylog.already_copied(f):
-            print("\t Already copied: {}".format(f))
+            print("\t Already copied file: {}".format(f))
         else:
             copylog.add(f)
             print("\t{}".format(f))
+            #print(get_dest_subfolder(tags, YYMMDD))
 
 
 def copy_pictures(logsfolder, picfiles, lookback_days):
-    if lookback_days < 1:
-        raise ValueError()
+    copyplan = CopyPlan(lookback_days)
 
     def name(path):
         return str(pathlib.Path(path).with_suffix(""))
@@ -287,19 +345,15 @@ def copy_pictures(logsfolder, picfiles, lookback_days):
 
     with CopyLog.load(logsfolder) as copylog:
         for g in groups.keys():
-            try_copy(copylog, groups[g])
+            try_copy(copyplan, copylog, groups[g])
 
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("-d", "--days", type=int, default=7, help="how many days ago to look for pictures")
-    args = parser.parse_args()
+def show_info():
+    pass
 
 
-    cfgfolder = "~/.importpics"
-    logsfolder = "~/.importpics/copylogs"
-
+def get_volume_list():
+    """:returns: list of removable media"""
     mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
     cmdpath = os.path.join(mypath, "findflash.macos.sh")
     cmd = shlex.split(cmdpath)
@@ -308,21 +362,68 @@ if __name__ == "__main__":
     if p.returncode != 0:
         print(stderr)
         sys.exit(1)
+    else:
+        return to_lines(stdout)
 
-    yymmdd = "%y%m%d"
-    #d.strftime("%y%m%d")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument("--test", action="store_true", default=False, help="run unit tests")
+    parser.add_argument("--info", action="store_true", default=False, help="dont cp, just show file info")
+    parser.add_argument("-d", "--days", type=int, default=7, help="how many days ago to look for pictures")
+    args = parser.parse_args()
 
     started = time.time()
+    metrics = Metrics()
+
+    if args.test:
+        import doctest
+        doctest.testmod()
+        sys.exit(0)
+
+    if args.info:
+        volume_list = get_volume_list()
+        volume_path = choose_volume(volume_list)
+        pics = all_pics(volume_path)
+        for p in pics:
+            if p.lower().endswith(".jpg"):
+                tags = exif_tags(p)
+                print(get_dest_subfolder(tags, YYMMDD))
+                date_tags = ["Image DateTime", "EXIF DateTimeOriginal", "EXIF DateTimeDigitized"]
+                dates = { tag: str(tags[tag]) for tag in tags.keys() if tag in date_tags }
+                
+                print(["{}=={}".format(d, parse(d)) for d in dates.values()])
+        print(metrics)
+        sys.exit(0)
+
+
+
+    cfgfolder = "~/.importpics"
+    logsfolder = "~/.importpics/copylogs"
+
+    #mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
+    #cmdpath = os.path.join(mypath, "findflash.macos.sh")
+    #cmd = shlex.split(cmdpath)
+    #p = subprocess.Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, stdin=PIPE, text=True)
+    #stdout, stderr = p.communicate()
+    #if p.returncode != 0:
+    #    print(stderr)
+    #    sys.exit(1)
+
+    #yymmdd = "%y%m%d"
+    #d.strftime("%y%m%d")
+
 
     if False:
         testpic = "/Volumes/NIKON D4/DCIM/205NC_D4/DSC_5376.JPG"
         tags = exif_tags(testpic)
         #print(exif_date(tags).strftime(yymmdd))
         #print(cam_hash(tags))
-        print(get_dest_subfolder(tags, yymmdd))
+        print(get_dest_subfolder(tags, YYMMDD))
         sys.exit(0)
 
-    volume_path = choose_volume(to_lines(stdout))
+    volume_list = get_volume_list()
+    volume_path = choose_volume(volume_list)
     pics = all_pics(volume_path)
     #for p in pics:
     #    print(p)
@@ -342,6 +443,7 @@ if __name__ == "__main__":
 
     elapsed_sec = int(time.time() - started)
     print("Total time: {} seconds".format(elapsed_sec))
+    # TODO - print total file paths seen
    
 
 
