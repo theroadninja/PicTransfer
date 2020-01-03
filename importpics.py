@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+Copies picture files taken by a camera from removable media like
+flash, automatically creating new folders based on dates.
+"""
 
 import argparse
 import collections
@@ -167,16 +171,19 @@ def get_dest_subfolder(tags, dateformat):
 
 
 class CopyLog:
-    def __init__(self):
-        self.copied_files = []
-        self.logfile = "copiedfiles.{}.{}.log".format(
+    def __init__(self, folder):
+        self.copied_files = set()
+        self.folder = folder
+        logfile = "copiedfiles.{}.{}.log".format(
             os.getpid(),
             int(time.time()),
         )
+        self.logfile = os.path.join(folder, logfile)
         self.fh = None
 
     def __enter__(self):
         self.fh = open(self.logfile, 'a')
+        return self
 
     def __exit__(self, extype, exval, trace):
         self.fh.flush()
@@ -187,43 +194,109 @@ class CopyLog:
             raise Exception("must call __enter__ before calling add")
         self.fh.write(copied_path)
         self.fh.write("\n")
+        # TODO: should we update copied_files ? in theory shouldnt need to...
+
+    def already_copied(self, *copied_path):
+        if len(copied_path) < 1:
+            raise ValueError()
+
+        for path in copied_path:
+            if not path in self.copied_files:
+                return False
+        return True
 
     @staticmethod
     def load(folder):
-        # TODO
-        return CopyLog()
+        folder = os.path.expanduser(folder)
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+
+        clog = CopyLog(folder)
+        entries = os.listdir(folder)
+        for e in entries:
+            fn = os.path.join(folder, e)
+            if os.path.isfile(fn) and fn.lower().endswith(".log"):
+                with open(fn, 'r') as f:
+                    lines = [line.strip() for line in f.readlines()]
+                    clog.copied_files.update(lines)
+        return clog
+
+class FileGroup:
+    """A group of files representing a single picture"""
+    def __init__(self):
+        self.files = []
+        self.base_path = None
+
+    def append(self, path):
+        self.files.append(path)
+        if self.base_path is None:
+            self.base_path = self.basepath(path)
+        elif self.base_path != self.basepath(path):
+            raise Exception("something went wrong")
+
+    def __iter__(self):
+        return self.files.__iter__()
+
+    def jpg(self):
+        jpgs = [f for f in self.files if f.lower().endswith(".jpg")]
+        if len(jpgs) != 1:
+            raise Exception("wrong number of jpg files")
+        return jpgs[0]
+                
+    @staticmethod
+    def basepath(path):
+        return str(pathlib.Path(path).with_suffix(""))
 
 
-def copy_pictures(logsfolder, picfiles):
-    logsfolder = os.path.expanduser(logsfolder)
-    if not os.path.exists(logsfolder):
-        os.makedirs(logsfolder)
+def try_copy(copylog, fg):
+    """
+    Tries to ensure all pictures files in the file group are copied
+    :param copylog: the log that tracks if files have already been copied
+    :param fg: object representing the group of files to copy
+    """
+    if copylog.already_copied(*fg):
+        print("Already copied: {}".format(fg.base_path))
+        return
 
-    # TODO - first see if the path is in the log
+    tags = exif_tags(fg.jpg())
+    d = exif_date(tags)
+    print(d.strftime(yymmdd))
 
-    # TODO - also need to group them by base filename
+    
+    print(fg.base_path)
+    for f in fg:
+        if copylog.already_copied(f):
+            print("\t Already copied: {}".format(f))
+        else:
+            copylog.add(f)
+            print("\t{}".format(f))
 
-    # str(pathlib.Path("/home/dave/a.txt").with_suffix(""))
+
+def copy_pictures(logsfolder, picfiles, lookback_days):
+    if lookback_days < 1:
+        raise ValueError()
+
     def name(path):
         return str(pathlib.Path(path).with_suffix(""))
 
-    groups = collections.defaultdict(list)
-
+    #groups = collections.defaultdict(list)
+    groups = collections.defaultdict(FileGroup)
     for p in picfiles:
-        groups[name(p)].append(p)
-        #print(p)
+        #groups[name(p)].append(p)
+        groups[FileGroup.basepath(p)].append(p)
 
-    copylog = CopyLog.load(logsfolder)
-    #with CopyLog.load(logsfolder) as copylog:
-    with copylog:
+    with CopyLog.load(logsfolder) as copylog:
         for g in groups.keys():
-            print(g)
-            for f in groups[g]:
-                copylog.add(f)
-                print("\t{}".format(f))
+            try_copy(copylog, groups[g])
+
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(__doc__)
+    parser.add_argument("-d", "--days", type=int, default=7, help="how many days ago to look for pictures")
+    args = parser.parse_args()
+
+
     cfgfolder = "~/.importpics"
     logsfolder = "~/.importpics/copylogs"
 
@@ -265,7 +338,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         sys.exit(1)
 
-    copy_pictures(logsfolder, pics)
+    copy_pictures(logsfolder, pics, args.days)
 
     elapsed_sec = int(time.time() - started)
     print("Total time: {} seconds".format(elapsed_sec))
