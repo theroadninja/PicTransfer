@@ -13,14 +13,17 @@ import collections
 import datetime
 #import inspect
 import hashlib
+import logging
 import os
 import pathlib
 import re
 import shlex
+import shutil
 #import subprocess
 #from subprocess import PIPE
 import sys
 import time
+import traceback
 
 # LIB
 import exifread
@@ -41,10 +44,17 @@ class Metrics:
         self.total_seen = None
         self.already_copied = None
         self.too_old = None
-        self.copied = None
+        self.copied = 0
+        self.failed = []
+        self.file_existed = 0 # skipped b/c file existed and size matches
+
         self.start_disk_avail = None # in bytes
         self.end_disk_avail = None
+        self.alt_folders = []
 
+    def inc_file_existed(self, items=None):
+        items = items or [1]
+        self.file_existed += len(items)
 
     def inc_already_copied(self, items = None):
         items = items or [1]
@@ -65,7 +75,7 @@ class Metrics:
 
     def __str__(self):
         lines = []
-        elapsed_sec = int(time.time()) - started
+        elapsed_sec = int(time.time()) - self.started
         lines.append("Total time: {} seconds".format(elapsed_sec))
         def p(msg, count):
             if count is not None:
@@ -74,16 +84,25 @@ class Metrics:
         #    lines.append("Total picture files found: {}".format(self.total_seen))
         #if self.already_copied is not None:
         #    lines.append("Already copied: {}".format(self.already_copied))
+        lines.append("Files copied successfully: {}".format(self.copied))
+        lines.append("")
         p("Total picture files found: {}", self.total_seen)
         p("Already copied: {}", self.already_copied)
+        p("Skipped because files already existed: {}", self.file_existed)
         p("Too old to copy: {}", self.too_old)
-        p("Copied: {}", self.copied)
+        lines.append("Files failed to copy: {}".format(len(self.failed)))
+        for f in self.failed:
+            lines.append("\t{}".format(f))
         if self.start_disk_avail is not None:
             avail = diskutil.human_readable(self.start_disk_avail)
             lines.append("Disk space available before copy: {}".format(avail))
         if self.end_disk_avail is not None:
             avail = diskutil.human_readable(self.end_disk_avail)
             lines.append("Disk space available after copy: {}".format(avail))
+        if self.alt_folders:
+            lines.append("Alternate folders created:")
+            for f in self.alt_folders:
+                lines.append("\t{}".format(f))
         return "\n".join(lines)
 
 def prompt(msg, default):
@@ -111,7 +130,22 @@ def parse_camera_date(datestr):
     return parse(datestr)
     pass
 
-def get_destpath(cfgfolder, cfgfile):
+def confirm(msg, autoyes):
+    msg = "{} y/N>".format(msg)
+    if autoyes:
+        print("{}y".format(msg))
+        return True
+    else:
+        yn = raw_input(msg).strip().lower()
+        #yn = raw_input("{} y/N>".format(msg)).strip().lower()
+        return yn in ["y", "yes"]
+
+def confirmOrDie(msg, autoyes):
+    if not confirm(msg, autoyes):
+        print("Aborting")
+        sys.exit(1)
+
+def get_destpath(logger, cfgfolder, cfgfile):
     cfgfolder = os.path.expanduser(cfgfolder)
     cfgfile = os.path.join(cfgfolder, cfgfile)
 
@@ -128,18 +162,25 @@ def get_destpath(cfgfolder, cfgfile):
 
     # if it doesnt exist but its in their home folder, give them option to auto-create
     if chosen_path.startswith(os.path.expanduser("~/")) and not os.path.exists(chosen_path):
-        yn = raw_input("{} does not exist.  Should I create it? y/N>".format(chosen_path)).strip().lower()
-        if yn in ["y", "yes"]:
+        # TODO - retest this
+        #yn = raw_input("{} does not exist.  Should I create it? y/N>".format(chosen_path)).strip().lower()
+        #if yn in ["y", "yes"]:
+        #    os.mkdir(chosen_path)
+        #else:
+        #    print("exiting")
+        #    sys.exit(1)
+        if confirm("{} does not exist.  Create it?".format(chosen_path), autoyes):
             os.mkdir(chosen_path)
         else:
-            print("exiting")
+            logger.error("exiting")
             sys.exit(1)
 
     # verify chosen path
     if os.path.isdir(chosen_path) and not chosen_path.startswith("/Volumes"):
         pass
     else:
-        print("cant copy to {}".format(chosen_path))
+        logger.error("cant copy to {}".format(chosen_path))
+        system.exit(1)
 
     if chosen_path != destpath:
         # TODO - this is blowing away the file
@@ -308,6 +349,10 @@ class FileGroup:
     def __init__(self):
         self.files = []
         self.base_path = None
+        self.total_bytes = None # size in bytes of all files
+        self.dest_subfolder = None # the folder with the date and cam hash
+        self.dest_subfolderalt = None # alternate folder that did not exist before copying started
+        self.exif_date = None # our best guess at the pic date from EXIF metadata
 
     def append(self, path):
         self.files.append(path)
@@ -331,11 +376,21 @@ class FileGroup:
 
 
 class CopyPlan:
-    def __init__(self, lookback_days, started_dt = None):
-        if lookback_days < 1:
+    def __init__(self, lookback_days, started_dt = None, force = False, maxpics = None):
+        if lookback_days < 1 or maxpics < 1:
             raise ValueError()
         self.lookback_days = lookback_days
         self.started_dt = started_dt or datetime.datetime.now()
+        self.force = force
+        self.groups_to_copy = []
+        self.bytes_to_copy = 0
+        self.start_disk_avail = None # avail. diskspace before copy in bytes 
+        self.destpath = None
+        self.maxpics = maxpics
+
+    def add(self, filegroup):
+        self.groups_to_copy.append(filegroup)
+        self.bytes_to_copy += filegroup.total_bytes
 
     def in_lookback(self, dt):
         """
@@ -353,44 +408,96 @@ class CopyPlan:
         """
         return (self.started_dt.date() - dt.date()).days <= self.lookback_days
 
-def try_copy(metrics, copyplan, copylog, fg):
+def schedule_copy(metrics, copyplan, copylog, fg):
     """
     Tries to ensure all pictures files in the file group are copied
     :param copylog: the log that tracks if files have already been copied
     :param fg: object representing the group of files to copy
     """
-    if copylog.already_copied(*fg):
+    if copyplan.maxpics and len(copyplan.groups_to_copy) >= copyplan.maxpics:
+        logger.debug("Skipping {} because already at max number".format(fg.base_path))
+        return
+
+    if (not copyplan.force) and copylog.already_copied(*fg):
         metrics.inc_already_copied(list(fg))
-        print("Already copied: {}".format(fg.base_path))
+        logger.debug("Already copied: {}".format(fg.base_path))
         return
 
     tags = exif_tags(fg.jpg())
-    d = exif_date(tags)
-    if not copyplan.in_lookback(d):
+    fg.dest_subfolder = get_dest_subfolder(tags, YYMMDD) # TODO dont re-calculate date twice
+    fg.dest_subfolderalt = diskutil.alt_folder(fg.dest_subfolder)
+
+    fg.exif_date = exif_date(tags)
+    if not copyplan.in_lookback(fg.exif_date):
         metrics.inc_too_old(list(fg))
-        print("Too old to copy: {}".format(fg.base_path))
+        logger.debug("Too old to copy: {}".format(fg.base_path))
         return
+    #print(d.strftime(YYMMDD))
 
     # get total file size for both files
-    print("file sizes for {}".format(fg.base_path))
+    #print(fg.base_path)
+    #print("file sizes for {}".format(fg.base_path))
+    fg.total_bytes = 0
     for f in fg:
-        print("\t{}".format(os.path.getsize(f)))
+        fsize = os.path.getsize(f)
+        fg.total_bytes += fsize
+        #print("\t{} ({})".format(fsize, diskutil.human_readable(fsize)))
+    #print("\tTotal bytes: {}".format(diskutil.human_readable(fg.total_bytes)))
 
-    print(d.strftime(YYMMDD))
-    print(fg.base_path)
+    copyplan.add(fg)
+
+
+
+def try_copy(metrics, copyplan, copylog, fg):
+    """
+    Copies all files for a picture, ensuring they will end up in the same place.
+    """
+    destfolder = os.path.join(copyplan.destpath, fg.dest_subfolder)
+    if not os.path.isdir(destfolder):
+        os.makedirs(destfolder)
+
+    # cases:
+    # - all files exist with correct size
+    # - all files exist with correct size OR are completely missing
+    #   (should be a superset of anything involving the copylog)
+    # - anything else?
+
+    use_alt_folder = False
     for f in fg:
-        if copylog.already_copied(f):
-            metrics.inc_already_copied()
-            print("\t Already copied file: {}".format(f))
+        fdest = os.path.join(destfolder, os.path.basename(f))
+        if os.path.isdir(f):
+            use_alt_folder = True # path is a dir somehow
+        elif os.path.isfile(f):
+            if os.path.getsize(f) != os.path.getsize(fdest):
+                use_alt_folder = True # file exists with wrong size
+
+    if use_alt_folder:
+        destfolder = os.path.join(copyplan.destpath, fg.dest_subfolderalt)
+        os.makedirs(destfolder)
+        metrics.alt_folders.append(destfolder)
+        
+
+    for f in fg:
+        fdest = os.path.join(destfolder, os.path.basename(f))
+        if os.path.isfile(fdest):
+            if os.path.getsize(f) == os.path.getsize(fdest):
+                logger.debug("skipping {} b/c it already exists with the correct size".format(fdest))
+                metrics.inc_file_existed() # TODO - record the filenames
+            else:
+                raise Exception("logic error copying files") # this should not happen
         else:
-            copylog.add(f)
-            metrics.inc_copied()
-            print("\t{}".format(f))
-            #print(get_dest_subfolder(tags, YYMMDD))
+            logger.debug("copying {} to {}".format(f, fdest))
+            try:
+                shutil.copy(f, fdest)
+                copylog.add(f)
+                metrics.inc_copied()
+            except IOError:
+                metrics.failed.append(fdest)
+                traceback.print_exc()
 
 
-def copy_pictures(metrics, logsfolder, picfiles, lookback_days):
-    copyplan = CopyPlan(lookback_days)
+def copy_pictures(logger, metrics, copyplan, logsfolder, picfiles, autoyes):
+    #copyplan = CopyPlan(lookback_days, force=force)
     metrics.total_seen = len(picfiles)
 
     def name(path):
@@ -402,9 +509,31 @@ def copy_pictures(metrics, logsfolder, picfiles, lookback_days):
         #groups[name(p)].append(p)
         groups[FileGroup.basepath(p)].append(p)
 
+    logger.info("Scanning for files to copy...")
     with CopyLog.load(logsfolder) as copylog:
+        # see which ones we can copy
         for g in groups.keys():
-            try_copy(metrics, copyplan, copylog, groups[g])
+            schedule_copy(metrics, copyplan, copylog, groups[g])
+
+        # TODO - check against filesystem avail
+        msg = "About to copy {} pictures at {}.  Continue?".format(
+            len(copyplan.groups_to_copy),
+            diskutil.human_readable(copyplan.bytes_to_copy),
+        )
+        confirmOrDie(msg, autoyes)
+
+        if copyplan.bytes_to_copy > copyplan.start_disk_avail:
+            msg = "Warning!  {} is more than the {} available at {}.  Are you sure you want to continue?"
+            msg = msg.format(
+                diskutil.hr(copyplan.bytes_to_copy),
+                diskutil.hr(copyplan.start_disk_avail),
+                copyplan.destpath,
+            )
+            confirmOrDie(msg, autoyes)
+
+        logger.info("Copying {} pictures".format(len(copyplan.groups_to_copy)))
+        for group in copyplan.groups_to_copy:
+            try_copy(metrics, copyplan, copylog, group)
 
 
 def show_info():
@@ -424,15 +553,33 @@ def show_info():
 #    else:
 #        return to_lines(stdout)
 
+def make_logger(verbose):
+    logger = logging.getLogger("importpics")
+    level = logging.INFO
+    if args.verbose:
+        level = logging.DEBUG
+    logger.setLevel(level)
+    logger.handlers = []
+    logger.addHandler(logging.StreamHandler())
+    return logger
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--test", action="store_true", default=False, help="run unit tests")
     parser.add_argument("--info", action="store_true", default=False, help="dont cp, just show file info")
     parser.add_argument("-d", "--days", type=int, default=7, help="how many days ago to look for pictures")
+    parser.add_argument("-f", "--force", action="store_true", default=False, help="copy files even if logs show they were already copied")
+    parser.add_argument("-n", "--number", type=int, default=None, help="Number of pictures (not number of files) to import")
+    parser.add_argument("-y", "--yes", action="store_true", default=False, help="Automatically answer 'yes' to all confirmation prompts")
+    parser.add_argument("-v", "--verbose", action="store_true", default=False, help="verbose logging")
+
     args = parser.parse_args()
 
-    started = time.time()
+
+
+    logger = make_logger(args.verbose)
+    #started = time.time()
     metrics = Metrics()
 
     if args.test:
@@ -460,52 +607,41 @@ if __name__ == "__main__":
     cfgfolder = "~/.importpics"
     logsfolder = "~/.importpics/copylogs"
 
-    #mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
-    #cmdpath = os.path.join(mypath, "findflash.macos.sh")
-    #cmd = shlex.split(cmdpath)
-    #p = subprocess.Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, stdin=PIPE, text=True)
-    #stdout, stderr = p.communicate()
-    #if p.returncode != 0:
-    #    print(stderr)
-    #    sys.exit(1)
-
-    #yymmdd = "%y%m%d"
-    #d.strftime("%y%m%d")
-
-
     if False:
         testpic = "/Volumes/NIKON D4/DCIM/205NC_D4/DSC_5376.JPG"
         tags = exif_tags(testpic)
-        #print(exif_date(tags).strftime(yymmdd))
-        #print(cam_hash(tags))
         print(get_dest_subfolder(tags, YYMMDD))
         sys.exit(0)
 
     volume_list = diskutil.get_volume_list()
     volume_path = choose_volume(volume_list)
     pics = all_pics(volume_path)
-    #for p in pics:
-    #    print(p)
-    #    #if p.lower().endswith(".jpg"):
-    #    #    tags = exif_tags(p)
-    #    #    print(get_dest_subfolder(tags, yymmdd))
-    #    #else:
-    #    #    print(p)
 
     try:
-        destpath = get_destpath(cfgfolder = cfgfolder, cfgfile = "importpicscfg")
-        print("chosen path is: " + destpath)
+        destpath = get_destpath(logger, cfgfolder = cfgfolder, cfgfile = "importpicscfg")
+        logger.info("chosen path is: " + destpath)
     except KeyboardInterrupt:
         sys.exit(1)
 
-    metrics.start_disk_avail = diskutil.avail_space(destpath)
-    copy_pictures(metrics, logsfolder, pics, args.days)
+
+    diskavail = diskutil.avail_space(destpath)
+    metrics.start_disk_avail = diskavail
+    copyplan = CopyPlan(lookback_days=args.days, force=args.force, maxpics=args.number)
+    copyplan.start_disk_avail = diskavail
+    copyplan.destpath = destpath
+    copy_pictures(logger, metrics, copyplan, logsfolder, pics, args.yes)
 
     metrics.end_disk_avail = diskutil.avail_space(destpath)
+    print("------------------")
+    print("Copy Results:")
     print(metrics)
     #elapsed_sec = int(time.time() - started)
     #print("Total time: {} seconds".format(elapsed_sec))
     #print("available space at {}: {}".format(destpath, diskutil.avail_space(destpath)))
+
+    # TODO: record total bytes copied
+    # TODO: allow someone to limit copy to X number of megabytes
+    # TODO: add a -y option
    
 
 

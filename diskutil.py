@@ -1,8 +1,12 @@
 # diskutil.py
 """
 Utility methods for dealing with disks
+
+TODO: the unit tests for this class create temp files
+AND dont even bother to clean them up.
 """
 import inspect
+import math
 import os
 import shlex
 import subprocess
@@ -65,7 +69,9 @@ def human_readable(bytecount):
         bytecount //= 1024
         prefix += 1
     return "{}{}".format(bytecount, df_sizes[prefix])
-        
+   
+
+hr = human_readable    
 
 
 def avail_space(path):
@@ -102,6 +108,59 @@ def get_volume_list():
         sys.exit(1)
     else:
         return to_lines(stdout)
+
+
+def alt_folder(simplename, digits=2, start=1):
+    """
+    Find an alternate folder by incrementing a digit
+
+    TODO:  unit test using temp files
+
+    so for folder1:
+        folder1
+        folder1_01
+        folder1_02
+        folder1_03
+        ...
+        folder1_99
+    >>> import tempfile
+    >>> import re
+    >>> folder = tempfile.mkdtemp(suffix="dtest")
+    >>> os.makedirs(os.path.join(folder, "1"))
+    >>> alt = alt_folder(folder, digits=1)
+    >>> re.sub(r"^.*dtest", "dtest", alt)
+    'dtest_1'
+    >>> os.makedirs(os.path.join(folder, alt))
+    >>> alt = alt_folder(folder, digits=1)
+    >>> re.sub(r"^.*dtest", "dtest", alt)
+    'dtest_2'
+    >>> os.makedirs(os.path.join(folder, alt))
+    >>> alt = alt_folder(folder, digits=1)
+    >>> re.sub(r"^.*dtest", "dtest", alt)
+    'dtest_3'
+    >>> re.sub(r"^.*dtest", "dtest", alt_folder(folder, digits=3))
+    'dtest_001'
+    >>> alt = alt_folder(folder, digits=1, start=9)
+    >>> re.sub(r"^.*dtest", "dtest", alt)
+    'dtest_9'
+    >>> os.makedirs(os.path.join(folder, alt))
+    >>> alt = alt_folder(folder, digits=1, start=9)
+    ... #doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+        ...
+    Exception: ...
+    """
+    if not simplename:
+        raise ValueError()
+    if digits < 1 or start < 0:
+        raise ValueError()
+    simplename = simplename.rstrip("/")
+    stop = int(math.pow(10, digits))
+    for alt in range(start, stop):
+        altfolder = "{}_{}".format(simplename, str(alt).zfill(digits))
+        if not os.path.isdir(altfolder):
+            return altfolder
+    raise Exception("cannot find alternate folder for {}".format(simplename))
 
 
 if __name__ == "__main__":
