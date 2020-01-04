@@ -5,13 +5,15 @@ flash, automatically creating new folders based on dates.
 
 Warning: this has to read all filenames into memory at once (in
 order to match jpg and nef files together, etc)
+
+TODO: not sure how the file size checking code will behave with a network file
+system....
 """
 
 # STL
 import argparse
 import collections
 import datetime
-#import inspect
 import hashlib
 import logging
 import os
@@ -19,8 +21,6 @@ import pathlib
 import re
 import shlex
 import shutil
-#import subprocess
-#from subprocess import PIPE
 import sys
 import time
 import traceback
@@ -39,6 +39,9 @@ except NameError: pass
 
 
 class Metrics:
+    """
+    Tracks metrics like how long it took to run, and how many files were copied.
+    """
     def __init__(self):
         self.started = int(time.time())
         self.total_seen = None
@@ -51,10 +54,6 @@ class Metrics:
         self.start_disk_avail = None # in bytes
         self.end_disk_avail = None
         self.alt_folders = []
-
-    #def inc_file_existed(self, items=None):
-    #    items = items or [1]
-    #    self.file_existed += len(items)
 
     def inc_already_copied(self, items = None):
         items = items or [1]
@@ -102,6 +101,13 @@ class Metrics:
         return "\n".join(lines)
 
 def prompt(msg, default):
+    """
+    Displays a prompt and returns user input.
+    :param msg: the message to display to the user
+    :param default: the default value to use if they hit enter without entering
+        a response (default is displayed in between [])
+    :return: the users response
+    """
     if default is None:
         return raw_input("{}>".format(msg))
     else:
@@ -110,10 +116,12 @@ def prompt(msg, default):
 
 def parse_camera_date(datestr):
     """
-    Nikon cameras seem to use this restarted format for dates:
+    Parses the date string from EXIF metadata into a python datetime.
+
+    Nikon cameras seem to use this retarded format for dates:
         2020:01:02 16:11:06
     and that seems to break both dateutil and dateparser.
-    So I have to manually provite a format :(
+    So I have to manually provide a format :(
 
     :param datestr: date string from EXIF metadata
 
@@ -127,6 +135,13 @@ def parse_camera_date(datestr):
     pass
 
 def confirm(msg, autoyes):
+    """
+    Displayes a yes/no message and returns the users response
+    :param msg: messages to display
+    :param autoyes: if true, confirm() returns true without waiting for user
+        input (for user with --yes args)
+    :returns: user yes/no response, as a boolean
+    """
     msg = "{} y/N>".format(msg)
     if autoyes:
         print("{}y".format(msg))
@@ -137,11 +152,19 @@ def confirm(msg, autoyes):
         return yn in ["y", "yes"]
 
 def confirmOrDie(msg, autoyes):
+    """
+    Displays a confirmation message, existing with status 1 if the user does not
+    response with yes.
+    """
     if not confirm(msg, autoyes):
         print("Aborting")
         sys.exit(1)
 
 def get_destpath(logger, cfgfolder, cfgfile, autoyes):
+    """
+    Determine the parent destination path (under with all of the day and camera
+    specific subfolders are placed).
+    """
     cfgfolder = os.path.expanduser(cfgfolder)
     cfgfile = os.path.join(cfgfolder, cfgfile)
 
@@ -178,6 +201,9 @@ def get_destpath(logger, cfgfolder, cfgfile, autoyes):
 
 
 def choose_volume(volumes):
+    """
+    Prompts the user to select with path to import pictures from.
+    """
     print("select which disk to import from (or ctrl+c to exit)")
     choices = {}
     for i, item in enumerate(volumes):
@@ -194,12 +220,10 @@ def choose_volume(volumes):
             print("that was not a valid choice -- press ctrl+c if you want to exit")
 
 
-#def to_lines(stdout):
-#    lines = [line.strip() for line in stdout.split("\n")]
-#    return [line for line in lines if line != ""]
-
-
 def ext_match(filename, extensions):
+    """
+    Tests a filename extension for case-insensitive match
+    """
     if filename is None:
         raise ValueError
 
@@ -210,8 +234,12 @@ def ext_match(filename, extensions):
 
 
 def all_pics(path, extensions = None):
+    """
+    Recursively search a path for all files that look like the might be
+    pictures.  This is based on the filename extension alone, so misnamed
+    files will be missed or be false positives.
+    """
     extensions = extensions or ["jpg", "nef", "png", "gif", "tiff"]
-    #print(os.listdir(path))
     pics = []
     for root, dirs, files in os.walk(path, topdown = True):
         dirs[:] = [d for d in dirs if not d.startswith(".")]
@@ -222,6 +250,18 @@ def all_pics(path, extensions = None):
 
 
 def cam_hash(tags):
+    """
+    Creates a string that should uniquely identify the camera.  Since this file
+    is being written for someone who primarily uses a nikon camera, a "nik" is
+    prepended if the make is nikon.
+
+    The hash is based on the make, model, and serial number, so if all of those
+    are present then it should be unique, however the hash is also truncated to
+    avoid creating annoyingly large filenames, so collisions could happen.
+    :param tags:  dictionary of EXIF tags
+    :returns: short string that is _probably_ uniq to the camera that took the
+        pic.
+    """
     cam_tags = ["Image Make", "Image Model", "MakerNote SerialNumber"]
     cam_values = { tag: str(tags[tag]) for tag in tags.keys() if tag in cam_tags }
     s = ""
@@ -234,6 +274,14 @@ def cam_hash(tags):
     return prefix + hashlib.md5(bytes(s, "utf-8")).digest().hex()[-6:]
     
 def exif_date(tags):
+    """
+    Determine the date the picture was taked based on certain exif
+    tags.  Different cameras use different tags, so this is a best effort,
+    however it is at least deterministic regardless of which order the tags appear
+    :param: dictionary of EXIF tags
+    :returns: datetime representing the date
+    :throws: if it can't find any date tags
+    """
     date_tags = ["Image DateTime", "EXIF DateTimeOriginal", "EXIF DateTimeDigitized"]
 
     dates = { tag: str(tags[tag]) for tag in tags.keys() if tag in date_tags }
@@ -245,34 +293,30 @@ def exif_date(tags):
     raise Exception("unable to read EXIF date of image")
 
 
-
 def exif_tags(filename):
+    """
+    Get the EXIF metadata from a JPG
+    :param filename: absolute path of the jpg, as a string
+    :returns: dictionary of (exif tag name -> tag object)
+    """
     if not filename.lower().endswith("jpg"):
         raise ValueError
-
     with open(filename, 'rb') as f:
         tags = exifread.process_file(f)
     return tags
+    # Convenient way to list them:
+    # for tag in tags.keys():
+    #     if len(str(tags[tag])) < 1024:
+    #         print(tag, str(tags[tag]))
 
-    #date_tags = ["Image DateTime", "EXIF DateTimeOriginal", "EXIF DateTimeDigitized"]
-
-    #for tag in tags.keys():
-    #    pass
-    #    #if tag in cam_tags:
-    #    #    print(tag, str(tags[tag]))
-
-    #    #if len(str(tags[tag])) < 1024:
-    #    #    print(tag, str(tags[tag]))
-
-    #    #if tag in date_tags:
-    #    #    print(tag, str(tags[tag]))
-
-    #    #if not tag.startswith("MakerNote"):
-    #    #    if "Date" in tag or "date" in tag or "time" in tag or "Time" in tag:
-    #    #        print(tag + " " + str(tags[tag]))
 
 
 def get_dest_subfolder(tags, dateformat):
+    """
+    Calculates the subfolder of a pic, based on the date and camera
+    hash.  This function does not handle the alternate numbers, like
+    _01 or _02; that happens later.
+    """
     return "{}_{}".format(
         exif_date(tags).strftime(dateformat),
         cam_hash(tags)
@@ -280,6 +324,16 @@ def get_dest_subfolder(tags, dateformat):
 
 
 class CopyLog:
+    """
+    Manages "copy logs" -- records of which files have previously been copied,
+    based on the assumption that the absolute path of a picture file written
+    to a flash card by a digital camera is always unique.
+
+    A copy log is written every time this program is run, and saved in a
+    folder.  All of those logs are read by this classes and the
+    previously-copied paths are merged into a single set to make it easy
+    to test if a source file has already been copied.
+    """
     def __init__(self, folder):
         self.copied_files = set()
         self.folder = folder
@@ -330,7 +384,14 @@ class CopyLog:
         return clog
 
 class FileGroup:
-    """A group of files representing a single picture"""
+    """
+    A group of files representing a single picture.
+    This is based on my understanding of:
+        "Design rule for Camera File system" (DCF)
+    It seems that multiple images files might be created for a single image,
+    e.g. a jpg and an nef, which will have the same basename and differ only by
+    their file extensions.
+    """
     def __init__(self):
         self.files = []
         self.base_path = None
@@ -361,8 +422,13 @@ class FileGroup:
 
 
 class CopyPlan:
+    """
+    Tracks which files are going to be copied, etc.
+    """
     def __init__(self, lookback_days, started_dt = None, force = False, maxpics = None):
-        if lookback_days < 1 or maxpics < 1:
+        if lookback_days < 1:
+            raise ValueError()
+        if maxpics and maxpics < 1:
             raise ValueError()
         self.lookback_days = lookback_days
         self.started_dt = started_dt or datetime.datetime.now()
@@ -436,11 +502,10 @@ def try_copy(metrics, copyplan, copylog, fg):
         os.makedirs(destfolder)
 
     # cases:
-    # - all files exist with correct size
-    # - all files exist with correct size OR are completely missing
+    # - all files exist with correct size => use dest folder
+    # - all files exist with correct size OR are completely missing => use dest folder and skip
     #   (should be a superset of anything involving the copylog)
-    # - anything else?
-
+    # - anything else? => copy everything to an alternate folder
     use_alt_folder = False
     for f in fg:
         fdest = os.path.join(destfolder, os.path.basename(f))
@@ -462,7 +527,6 @@ def try_copy(metrics, copyplan, copylog, fg):
             if os.path.getsize(f) == os.path.getsize(fdest):
                 logger.debug("skipping {} b/c it already exists with the correct size".format(fdest))
                 metrics.file_existed.append(f)
-                #metrics.inc_file_existed() # TODO - record the filenames
             else:
                 raise Exception("logic error copying files") # this should not happen
         else:
@@ -477,16 +541,17 @@ def try_copy(metrics, copyplan, copylog, fg):
 
 
 def copy_pictures(logger, metrics, copyplan, logsfolder, picfiles, autoyes):
-    #copyplan = CopyPlan(lookback_days, force=force)
+    """
+    This is the main method.  Scans the pictures to figure out which ones to
+    copy, and copies them.
+    """
     metrics.total_seen = len(picfiles)
 
     def name(path):
         return str(pathlib.Path(path).with_suffix(""))
 
-    #groups = collections.defaultdict(list)
     groups = collections.defaultdict(FileGroup)
     for p in picfiles:
-        #groups[name(p)].append(p)
         groups[FileGroup.basepath(p)].append(p)
 
     logger.info("Scanning for files to copy...")
@@ -520,19 +585,6 @@ def show_info():
     pass
 
 
-#def get_volume_list():
-#    """:returns: list of removable media"""
-#    mypath = os.path.dirname(os.path.abspath(inspect.stack()[0][1]))
-#    cmdpath = os.path.join(mypath, "findflash.macos.sh")
-#    cmd = shlex.split(cmdpath)
-#    p = subprocess.Popen(cmd, shell=False, stdout=PIPE, stderr=PIPE, stdin=PIPE, text=True)
-#    stdout, stderr = p.communicate()
-#    if p.returncode != 0:
-#        print(stderr)
-#        sys.exit(1)
-#    else:
-#        return to_lines(stdout)
-
 def make_logger(verbose):
     logger = logging.getLogger("importpics")
     level = logging.INFO
@@ -553,13 +605,9 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--number", type=int, default=None, help="Number of pictures (not number of files) to import")
     parser.add_argument("-y", "--yes", action="store_true", default=False, help="Automatically answer 'yes' to all confirmation prompts")
     parser.add_argument("-v", "--verbose", action="store_true", default=False, help="verbose logging")
-
     args = parser.parse_args()
 
-
-
     logger = make_logger(args.verbose)
-    #started = time.time()
     metrics = Metrics()
 
     if args.test:
@@ -582,17 +630,9 @@ if __name__ == "__main__":
         print(metrics)
         sys.exit(0)
 
-
-
     cfgfolder = "~/.importpics"
     logsfolder = "~/.importpics/copylogs"
     logger.info("Using copy logs in {}".format(logsfolder))
-
-    if False:
-        testpic = "/Volumes/NIKON D4/DCIM/205NC_D4/DSC_5376.JPG"
-        tags = exif_tags(testpic)
-        print(get_dest_subfolder(tags, YYMMDD))
-        sys.exit(0)
 
     volume_list = diskutil.get_volume_list()
     volume_path = choose_volume(volume_list)
@@ -603,7 +643,6 @@ if __name__ == "__main__":
         logger.info("chosen path is: " + destpath)
     except KeyboardInterrupt:
         sys.exit(1)
-
 
     diskavail = diskutil.avail_space(destpath)
     metrics.start_disk_avail = diskavail
@@ -616,15 +655,3 @@ if __name__ == "__main__":
     print("------------------")
     print("Copy Results:")
     print(metrics)
-    #elapsed_sec = int(time.time() - started)
-    #print("Total time: {} seconds".format(elapsed_sec))
-    #print("available space at {}: {}".format(destpath, diskutil.avail_space(destpath)))
-
-    # TODO: record total bytes copied
-    # TODO: allow someone to limit copy to X number of megabytes
-    # TODO: add a -y option
-   
-
-
-
-
