@@ -481,7 +481,7 @@ def schedule_copy(metrics, copyplan, copylog, fg):
     fg.exif_date = exif_date(tags)
     if not copyplan.in_lookback(fg.exif_date):
         metrics.inc_too_old(list(fg))
-        logger.debug("Too old to copy: {}".format(fg.base_path))
+        logger.debug("Too old to copy: {} was taken on {}".format(fg.base_path, fg.exif_date))
         return
 
     fg.total_bytes = 0
@@ -489,6 +489,7 @@ def schedule_copy(metrics, copyplan, copylog, fg):
         fsize = os.path.getsize(f)
         fg.total_bytes += fsize
 
+    logger.debug("Planning to copy: {}".format(fg.base_path))
     copyplan.add(fg)
 
 
