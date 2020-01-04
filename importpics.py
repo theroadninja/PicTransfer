@@ -46,15 +46,15 @@ class Metrics:
         self.too_old = None
         self.copied = 0
         self.failed = []
-        self.file_existed = 0 # skipped b/c file existed and size matches
+        self.file_existed = [] # not in copy log, but existed with correct size
 
         self.start_disk_avail = None # in bytes
         self.end_disk_avail = None
         self.alt_folders = []
 
-    def inc_file_existed(self, items=None):
-        items = items or [1]
-        self.file_existed += len(items)
+    #def inc_file_existed(self, items=None):
+    #    items = items or [1]
+    #    self.file_existed += len(items)
 
     def inc_already_copied(self, items = None):
         items = items or [1]
@@ -80,15 +80,11 @@ class Metrics:
         def p(msg, count):
             if count is not None:
                 lines.append(msg.format(count))
-        #if self.total_seen is not None:
-        #    lines.append("Total picture files found: {}".format(self.total_seen))
-        #if self.already_copied is not None:
-        #    lines.append("Already copied: {}".format(self.already_copied))
         lines.append("Files copied successfully: {}".format(self.copied))
         lines.append("")
         p("Total picture files found: {}", self.total_seen)
         p("Already copied: {}", self.already_copied)
-        p("Skipped because files already existed: {}", self.file_existed)
+        p("Skipped because files already existed: {}", len(self.file_existed))
         p("Too old to copy: {}", self.too_old)
         lines.append("Files failed to copy: {}".format(len(self.failed)))
         for f in self.failed:
@@ -145,7 +141,7 @@ def confirmOrDie(msg, autoyes):
         print("Aborting")
         sys.exit(1)
 
-def get_destpath(logger, cfgfolder, cfgfile):
+def get_destpath(logger, cfgfolder, cfgfile, autoyes):
     cfgfolder = os.path.expanduser(cfgfolder)
     cfgfile = os.path.join(cfgfolder, cfgfile)
 
@@ -162,18 +158,8 @@ def get_destpath(logger, cfgfolder, cfgfile):
 
     # if it doesnt exist but its in their home folder, give them option to auto-create
     if chosen_path.startswith(os.path.expanduser("~/")) and not os.path.exists(chosen_path):
-        # TODO - retest this
-        #yn = raw_input("{} does not exist.  Should I create it? y/N>".format(chosen_path)).strip().lower()
-        #if yn in ["y", "yes"]:
-        #    os.mkdir(chosen_path)
-        #else:
-        #    print("exiting")
-        #    sys.exit(1)
-        if confirm("{} does not exist.  Create it?".format(chosen_path), autoyes):
-            os.mkdir(chosen_path)
-        else:
-            logger.error("exiting")
-            sys.exit(1)
+        confirmOrDie("{} does not exist.  Create it?".format(chosen_path), autoyes)
+        os.mkdir(chosen_path)
 
     # verify chosen path
     if os.path.isdir(chosen_path) and not chosen_path.startswith("/Volumes"):
@@ -317,7 +303,6 @@ class CopyLog:
             raise Exception("must call __enter__ before calling add")
         self.fh.write(copied_path)
         self.fh.write("\n")
-        # TODO: should we update copied_files ? in theory shouldnt need to...
 
     def already_copied(self, *copied_path):
         if len(copied_path) < 1:
@@ -432,17 +417,11 @@ def schedule_copy(metrics, copyplan, copylog, fg):
         metrics.inc_too_old(list(fg))
         logger.debug("Too old to copy: {}".format(fg.base_path))
         return
-    #print(d.strftime(YYMMDD))
 
-    # get total file size for both files
-    #print(fg.base_path)
-    #print("file sizes for {}".format(fg.base_path))
     fg.total_bytes = 0
     for f in fg:
         fsize = os.path.getsize(f)
         fg.total_bytes += fsize
-        #print("\t{} ({})".format(fsize, diskutil.human_readable(fsize)))
-    #print("\tTotal bytes: {}".format(diskutil.human_readable(fg.total_bytes)))
 
     copyplan.add(fg)
 
@@ -465,9 +444,9 @@ def try_copy(metrics, copyplan, copylog, fg):
     use_alt_folder = False
     for f in fg:
         fdest = os.path.join(destfolder, os.path.basename(f))
-        if os.path.isdir(f):
+        if os.path.isdir(fdest):
             use_alt_folder = True # path is a dir somehow
-        elif os.path.isfile(f):
+        elif os.path.isfile(fdest):
             if os.path.getsize(f) != os.path.getsize(fdest):
                 use_alt_folder = True # file exists with wrong size
 
@@ -482,7 +461,8 @@ def try_copy(metrics, copyplan, copylog, fg):
         if os.path.isfile(fdest):
             if os.path.getsize(f) == os.path.getsize(fdest):
                 logger.debug("skipping {} b/c it already exists with the correct size".format(fdest))
-                metrics.inc_file_existed() # TODO - record the filenames
+                metrics.file_existed.append(f)
+                #metrics.inc_file_existed() # TODO - record the filenames
             else:
                 raise Exception("logic error copying files") # this should not happen
         else:
@@ -606,6 +586,7 @@ if __name__ == "__main__":
 
     cfgfolder = "~/.importpics"
     logsfolder = "~/.importpics/copylogs"
+    logger.info("Using copy logs in {}".format(logsfolder))
 
     if False:
         testpic = "/Volumes/NIKON D4/DCIM/205NC_D4/DSC_5376.JPG"
@@ -618,7 +599,7 @@ if __name__ == "__main__":
     pics = all_pics(volume_path)
 
     try:
-        destpath = get_destpath(logger, cfgfolder = cfgfolder, cfgfile = "importpicscfg")
+        destpath = get_destpath(logger, cfgfolder = cfgfolder, cfgfile = "importpicscfg", autoyes=args.yes)
         logger.info("chosen path is: " + destpath)
     except KeyboardInterrupt:
         sys.exit(1)
